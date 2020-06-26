@@ -16,25 +16,26 @@ class LookaheadMinimax(Optimizer):
     Lookahead Optimizer: https://arxiv.org/abs/1907.08610
     """
 
-    def __init__(self, G_optimizer, D_optimizer, la_steps=5, la_alpha=0.5, pullback_momentum="none"):
+    def __init__(self, G_optimizer, D_optimizer, la_steps=5, la_alpha=0.5, pullback_momentum="none", accumulate=1):
         """
         G_optimizer: generator optimizer
         D_optimizer: discriminator optimizer
         la_steps (int): number of lookahead steps
         la_alpha (float): linear interpolation factor. 1.0 recovers the inner optimizer.
         pullback_momentum (str): change to inner optimizer momentum on interpolation update
+        acumulate (int): number of gradient accumulation steps
         """
         self.G_optimizer = G_optimizer
         self.D_optimizer = D_optimizer
 
         self._la_step = 0  # counter for inner optimizer
         self.la_alpha = la_alpha
-        self._total_la_steps = la_steps
+        self._total_la_steps = la_steps * accumulate
+        self._la_steps = la_steps
 
         pullback_momentum = pullback_momentum.lower()
         assert pullback_momentum in ["reset", "pullback", "none"]
-        self.G_pullback_momentum = G_pullback_momentum
-        self.D_pullback_momentum = D_pullback_momentum
+        self.pullback_momentum = pullback_momentum
 
         self.state = defaultdict(dict)
 
@@ -62,24 +63,39 @@ class LookaheadMinimax(Optimizer):
             "D_optimizer": self.D_optimizer,
             "la_alpha": self.la_alpha,
             "_la_step": self._la_step,
-            "_total_la_steps": self._total_la_steps,
-            "G_pullback_momentum": self.G_pullback_momentum,
-            "D_pullback_momentum": self.D_pullback_momentum,
+            "_total_la_steps": self._la_steps,
+            "pullback_momentum": self.pullback_momentum,
         }
 
     def zero_grad(self):
         self.G_optimizer.zero_grad()
-        self.D_optimizer.zero_grad()
 
     def get_la_step(self):
         return self._la_step
 
     def state_dict(self):
-        return self.G_optimizer.state_dict(), self.D_optimizer.state_dict()
+        return self.G_optimizer.state_dict()
 
     def load_state_dict(self, G_state_dict, D_state_dict):
         self.G_optimizer.load_state_dict(G_state_dict)
         self.D_optimizer.load_state_dict(D_state_dict)
+
+        # Cache the current optimizer parameters
+        for group in self.G_optimizer.param_groups:
+            for p in group["params"]:
+                param_state = self.state[p]
+                param_state["cached_G_params"] = torch.zeros_like(p.data)
+                param_state["cached_G_params"].copy_(p.data)
+                if self.pullback_momentum == "pullback":
+                    param_state["cached_G_mom"] = self.G_optimizer.state[p]["momentum_buffer"]
+
+        for group in self.D_optimizer.param_groups:
+            for p in group["params"]:
+                param_state = self.state[p]
+                param_state["cached_D_params"] = torch.zeros_like(p.data)
+                param_state["cached_D_params"].copy_(p.data)
+                if self.pullback_momentum == "pullback":
+                    param_state["cached_D_mom"] = self.D_optimizer.state[p]["momentum_buffer"]
 
     def _backup_and_load_cache(self):
         """
@@ -114,7 +130,7 @@ class LookaheadMinimax(Optimizer):
 
     @property
     def param_groups(self):
-        return self.G_optimizer.param_groups, self.D_optimizer.param_groups
+        return self.G_optimizer.param_groups
 
     def step(self, closure=None):
         """
